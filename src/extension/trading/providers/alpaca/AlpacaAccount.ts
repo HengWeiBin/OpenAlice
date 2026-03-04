@@ -295,19 +295,10 @@ export class AlpacaAccount implements ITradingAccount {
 
   getCapabilities(): AccountCapabilities {
     return {
-      supportsLeverage: false,
-      supportsShort: false,
-      supportsNotional: true,
-      supportsFundingRate: false,
-      supportsOrderBook: false,
-      supportsMarketClock: true,
-      supportsExtendedHours: true,
       supportedSecTypes: ['STK'],
       supportedOrderTypes: ['market', 'limit', 'stop', 'stop_limit'],
     }
   }
-
-  // ---- Optional extensions ----
 
   async getMarketClock(): Promise<MarketClock> {
     const clock = await this.client.getClock() as AlpacaClockRaw

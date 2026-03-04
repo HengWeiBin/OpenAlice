@@ -129,13 +129,6 @@ export interface MarketClock {
 // ==================== Account capabilities ====================
 
 export interface AccountCapabilities {
-  supportsLeverage: boolean
-  supportsShort: boolean
-  supportsNotional: boolean
-  supportsFundingRate: boolean
-  supportsOrderBook: boolean
-  supportsMarketClock: boolean
-  supportsExtendedHours: boolean
   supportedSecTypes: SecType[]
   supportedOrderTypes: OrderRequest['type'][]
 }
@@ -157,7 +150,7 @@ export interface ITradingAccount {
   init(): Promise<void>
   close(): Promise<void>
 
-  // ---- Contract resolution (IBKR-style search) ----
+  // ---- Contract resolution ----
 
   resolveContract(query: Partial<Contract>): Promise<Contract[]>
 
@@ -173,17 +166,11 @@ export interface ITradingAccount {
   getPositions(): Promise<Position[]>
   getOrders(): Promise<Order[]>
   getQuote(contract: Contract): Promise<Quote>
+  getMarketClock(): Promise<MarketClock>
 
   // ---- Capabilities ----
 
   getCapabilities(): AccountCapabilities
-
-  // ---- Optional extensions ----
-
-  getMarketClock?(): Promise<MarketClock>
-  getFundingRate?(contract: Contract): Promise<FundingRate>
-  getOrderBook?(contract: Contract, limit?: number): Promise<OrderBook>
-  adjustLeverage?(contract: Contract, leverage: number): Promise<{ success: boolean; error?: string }>
 }
 
 // ==================== Wallet state ====================

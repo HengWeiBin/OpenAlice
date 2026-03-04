@@ -25,14 +25,14 @@ export interface AccountResolver {
   getGitState: (accountId: string) => Promise<GitState> | undefined
 }
 
-// ==================== Internal helpers ====================
+// ==================== Exported helpers (used by provider tools) ====================
 
-interface ResolvedAccount {
+export interface ResolvedAccount {
   account: ITradingAccount
   id: string
 }
 
-function resolveAccounts(
+export function resolveAccounts(
   mgr: AccountManager,
   source?: string,
 ): ResolvedAccount[] {
@@ -53,7 +53,7 @@ function resolveAccounts(
   return byProvider
 }
 
-function resolveOne(
+export function resolveOne(
   mgr: AccountManager,
   source: string,
 ): ResolvedAccount {
@@ -256,13 +256,15 @@ Use this to check current prices before placing orders.`,
       }),
       execute: async ({ source }) => {
         const targets = resolveAccounts(accountManager, source)
-        for (const { account, id } of targets) {
-          if (account.getMarketClock) {
+        if (targets.length === 0) return { error: 'No accounts available.' }
+
+        const results = await Promise.all(
+          targets.map(async ({ account, id }) => {
             const clock = await account.getMarketClock()
             return { source: id, ...clock }
-          }
-        }
-        return { error: 'No account supports market clock.' }
+          }),
+        )
+        return results.length === 1 ? results[0] : results
       },
     }),
 
@@ -715,89 +717,6 @@ Use this after placing limit/stop orders to check if they've been filled.`,
 
         if (results.length === 0) return { message: 'No pending orders to sync.', updatedCount: 0 }
         return results.length === 1 ? results[0] : results
-      },
-    }),
-
-    // ==================== Adjust Leverage (mutation, source required) ====================
-
-    adjustLeverage: tool({
-      description: `Stage a leverage adjustment (will execute on tradingPush).
-
-Adjust leverage for an existing position without changing position size.
-This will adjust margin requirements.
-
-NOTE: This stages the operation. Call tradingCommit + tradingPush to execute.`,
-      inputSchema: z.object({
-        source: z.string().describe(sourceDesc(true)),
-        symbol: z.string().describe('Trading pair symbol'),
-        newLeverage: z
-          .number()
-          .int()
-          .min(1)
-          .max(20)
-          .describe('New leverage (1-20)'),
-      }),
-      execute: ({ source, symbol, newLeverage }) => {
-        const { id, account } = resolveOne(accountManager, source)
-        if (!account.getCapabilities().supportsLeverage) {
-          return { error: `Account "${id}" does not support leverage adjustment.` }
-        }
-        const git = requireGit(resolver, id)
-        return git.add({
-          action: 'adjustLeverage',
-          params: { symbol, newLeverage },
-        })
-      },
-    }),
-
-    // ==================== Funding Rate (query, source required) ====================
-
-    getFundingRate: tool({
-      description: `Query the current funding rate for a perpetual contract.
-
-Returns:
-- fundingRate: current/latest funding rate (e.g. 0.0001 = 0.01%)
-- nextFundingTime: when the next funding payment occurs
-- previousFundingRate: the previous period's rate
-
-Positive rate = longs pay shorts. Negative rate = shorts pay longs.`,
-      inputSchema: z.object({
-        source: z.string().describe(sourceDesc(true)),
-        symbol: z.string().describe('Trading pair symbol'),
-      }),
-      execute: async ({ source, symbol }) => {
-        const { id, account } = resolveOne(accountManager, source)
-        if (!account.getFundingRate) {
-          return { error: `Account "${id}" does not support funding rates.` }
-        }
-        return await account.getFundingRate({ symbol })
-      },
-    }),
-
-    // ==================== Order Book (query, source required) ====================
-
-    getOrderBook: tool({
-      description: `Query the order book (market depth) for a symbol.
-
-Returns bids and asks sorted by price. Each level is [price, amount].
-Use this to evaluate liquidity and potential slippage before placing large orders.`,
-      inputSchema: z.object({
-        source: z.string().describe(sourceDesc(true)),
-        symbol: z.string().describe('Trading pair symbol'),
-        limit: z
-          .number()
-          .int()
-          .min(1)
-          .max(100)
-          .optional()
-          .describe('Number of price levels per side (default: 20)'),
-      }),
-      execute: async ({ source, symbol, limit }) => {
-        const { id, account } = resolveOne(accountManager, source)
-        if (!account.getOrderBook) {
-          return { error: `Account "${id}" does not support order book queries.` }
-        }
-        return await account.getOrderBook({ symbol }, limit ?? 20)
       },
     }),
   }

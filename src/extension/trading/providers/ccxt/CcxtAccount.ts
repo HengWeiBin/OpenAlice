@@ -18,10 +18,15 @@ import type {
   OrderRequest,
   OrderResult,
   Quote,
+  MarketClock,
   FundingRate,
   OrderBook,
   OrderBookLevel,
 } from '../../interfaces.js'
+import { tool } from 'ai'
+import { z } from 'zod'
+import { resolveAccounts } from '../../adapter.js'
+import type { AccountResolver } from '../../adapter.js'
 
 export interface CcxtAccountConfig {
   id?: string
@@ -449,19 +454,117 @@ export class CcxtAccount implements ITradingAccount {
 
   getCapabilities(): AccountCapabilities {
     return {
-      supportsLeverage: true,
-      supportsShort: true,
-      supportsNotional: false,
-      supportsFundingRate: true,
-      supportsOrderBook: true,
-      supportsMarketClock: false,
-      supportsExtendedHours: false,
       supportedSecTypes: ['CRYPTO'],
       supportedOrderTypes: ['market', 'limit'],
     }
   }
 
-  // ---- Optional extensions ----
+  async getMarketClock(): Promise<MarketClock> {
+    return {
+      isOpen: true,
+      timestamp: new Date(),
+    }
+  }
+
+  // ---- Provider tools (registered dynamically when account comes online) ----
+
+  static createProviderTools(resolver: AccountResolver) {
+    const { accountManager } = resolver
+
+    /** Resolve to exactly one CcxtAccount. Returns error object if unable. */
+    const resolveCcxtOne = (source?: string): { account: CcxtAccount; id: string } | { error: string } => {
+      const targets = resolveAccounts(accountManager, source)
+        .filter((t): t is { account: CcxtAccount; id: string } => t.account instanceof CcxtAccount)
+      if (targets.length === 0) return { error: 'No CCXT account available.' }
+      if (targets.length > 1) {
+        return { error: `Multiple CCXT accounts: ${targets.map(t => t.id).join(', ')}. Specify source.` }
+      }
+      return targets[0]
+    }
+
+    const sourceDesc =
+      'Account source — matches account id or provider name. Auto-resolves if only one CCXT account exists.'
+
+    return {
+      getFundingRate: tool({
+        description: `Query the current funding rate for a perpetual contract.
+
+Returns:
+- fundingRate: current/latest funding rate (e.g. 0.0001 = 0.01%)
+- nextFundingTime: when the next funding payment occurs
+- previousFundingRate: the previous period's rate
+
+Positive rate = longs pay shorts. Negative rate = shorts pay longs.`,
+        inputSchema: z.object({
+          symbol: z.string().describe('Trading pair symbol'),
+          source: z.string().optional().describe(sourceDesc),
+        }),
+        execute: async ({ symbol, source }) => {
+          const resolved = resolveCcxtOne(source)
+          if ('error' in resolved) return resolved
+          const { account, id } = resolved
+          const result = await account.getFundingRate({ symbol })
+          return { source: id, ...result }
+        },
+      }),
+
+      getOrderBook: tool({
+        description: `Query the order book (market depth) for a symbol.
+
+Returns bids and asks sorted by price. Each level is [price, amount].
+Use this to evaluate liquidity and potential slippage before placing large orders.`,
+        inputSchema: z.object({
+          symbol: z.string().describe('Trading pair symbol'),
+          limit: z
+            .number()
+            .int()
+            .min(1)
+            .max(100)
+            .optional()
+            .describe('Number of price levels per side (default: 20)'),
+          source: z.string().optional().describe(sourceDesc),
+        }),
+        execute: async ({ symbol, limit, source }) => {
+          const resolved = resolveCcxtOne(source)
+          if ('error' in resolved) return resolved
+          const { account, id } = resolved
+          const result = await account.getOrderBook({ symbol }, limit ?? 20)
+          return { source: id, ...result }
+        },
+      }),
+
+      adjustLeverage: tool({
+        description: `Stage a leverage adjustment for a crypto trading pair (will execute on tradingPush).
+
+Adjust leverage without changing position size. This will adjust margin requirements.
+
+NOTE: This stages the operation. Call tradingCommit + tradingPush to execute.`,
+        inputSchema: z.object({
+          symbol: z.string().describe('Trading pair symbol'),
+          newLeverage: z
+            .number()
+            .int()
+            .min(1)
+            .max(20)
+            .describe('New leverage (1-20)'),
+          source: z.string().optional().describe(sourceDesc),
+        }),
+        execute: ({ symbol, newLeverage, source }) => {
+          const resolved = resolveCcxtOne(source)
+          if ('error' in resolved) return resolved
+          const { id } = resolved
+          const git = resolver.getGit(id)
+          if (!git) return { error: `No trading history for account "${id}"` }
+          return git.add({
+            action: 'adjustLeverage',
+            params: { symbol, newLeverage },
+          })
+        },
+      }),
+    }
+  }
+
+  // ---- Provider-specific methods ----
 
   async getFundingRate(contract: Contract): Promise<FundingRate> {
     this.ensureInit()

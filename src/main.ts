@@ -10,6 +10,7 @@ import { McpAskPlugin } from './connectors/mcp-ask/index.js'
 import { createThinkingTools } from './extension/thinking-kit/index.js'
 import {
   AccountManager,
+  CcxtAccount,
   wireAccountTrading,
   createAlpacaFromConfig,
   createCcxtFromConfig,
@@ -342,6 +343,18 @@ async function main() {
         })
         accountManager.addAccount(newAccount)
         accountSetups.set(newAccount.id, { setup, gitFilePath: CRYPTO_GIT_FILE })
+
+        // Re-register provider tools (dynamic resolution means existing tools still work,
+        // but this handles the case where CCXT initially failed and tools were never registered)
+        toolCenter.register(
+          CcxtAccount.createProviderTools({
+            accountManager,
+            getGit: (id) => accountSetups.get(id)?.setup.git,
+            getGitState: (id) => accountSetups.get(id)?.setup.getGitState(),
+          }),
+          'trading-ccxt',
+        )
+
         console.log(`reconnect: ${newAccount.label} online`)
         return { success: true, message: `${newAccount.label} reconnected` }
       }
@@ -470,7 +483,18 @@ async function main() {
     })
     accountManager.addAccount(readyAccount)
     accountSetups.set(readyAccount.id, { setup, gitFilePath: CRYPTO_GIT_FILE })
-    console.log(`ccxt: ${readyAccount.label} online`)
+
+    // Register CCXT-specific tools (getFundingRate, getOrderBook, adjustLeverage)
+    toolCenter.register(
+      CcxtAccount.createProviderTools({
+        accountManager,
+        getGit: (id) => accountSetups.get(id)?.setup.git,
+        getGitState: (id) => accountSetups.get(id)?.setup.getGitState(),
+      }),
+      'trading-ccxt',
+    )
+
+    console.log(`ccxt: ${readyAccount.label} online + provider tools registered`)
   })
 
   // ==================== Shutdown ====================

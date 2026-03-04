@@ -30,13 +30,6 @@ export const DEFAULT_ACCOUNT_INFO: AccountInfo = {
 }
 
 export const DEFAULT_CAPABILITIES: AccountCapabilities = {
-  supportsLeverage: false,
-  supportsShort: false,
-  supportsNotional: true,
-  supportsFundingRate: false,
-  supportsOrderBook: false,
-  supportsMarketClock: true,
-  supportsExtendedHours: true,
   supportedSecTypes: ['STK'],
   supportedOrderTypes: ['market', 'limit', 'stop', 'stop_limit'],
 }

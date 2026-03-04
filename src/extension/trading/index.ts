@@ -85,8 +85,8 @@ export { wireAccountTrading, createAlpacaFromConfig, createCcxtFromConfig } from
 export type { AccountSetup } from './factory.js'
 
 // Unified Tool Factory
-export { createTradingTools } from './adapter.js'
-export type { AccountResolver } from './adapter.js'
+export { createTradingTools, resolveAccounts, resolveOne } from './adapter.js'
+export type { AccountResolver, ResolvedAccount } from './adapter.js'
 
 // Providers
 export { AlpacaAccount } from './providers/alpaca/index.js'

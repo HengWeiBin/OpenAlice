@@ -82,7 +82,10 @@ export function createOperationDispatcher(account: ITradingAccount) {
       }
 
       case 'adjustLeverage': {
-        if (!account.adjustLeverage) {
+        // adjustLeverage is a provider-specific method (not on ITradingAccount)
+        // Duck-type check: only CcxtAccount (and similar) will have it
+        const fn = (account as unknown as Record<string, unknown>).adjustLeverage
+        if (typeof fn !== 'function') {
           return { success: false, error: 'Account does not support leverage adjustment' }
         }
 
@@ -91,7 +94,7 @@ export function createOperationDispatcher(account: ITradingAccount) {
         if (op.params.symbol) contract.symbol = op.params.symbol as string
 
         const newLeverage = op.params.newLeverage as number
-        return account.adjustLeverage(contract as Contract, newLeverage)
+        return fn.call(account, contract as Contract, newLeverage)
       }
 
       default:
