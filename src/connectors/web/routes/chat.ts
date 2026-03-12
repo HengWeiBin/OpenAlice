@@ -53,7 +53,20 @@ export function createChatRoutes({ ctx, sessions, sseByChannel }: ChatDeps) {
       channel: 'web', to: channelId, prompt: message,
     })
 
-    const result = await ctx.engine.askWithSession(message, session, opts)
+    const stream = ctx.agentCenter.askWithSession(message, session, opts)
+
+    // Stream events to SSE clients for this channel as they arrive
+    const channelClients = sseByChannel.get(channelId) ?? new Map()
+    for await (const event of stream) {
+      if (event.type === 'done') continue
+      const data = JSON.stringify({ type: 'stream', event })
+      for (const client of channelClients.values()) {
+        try { client.send(data) } catch { /* disconnected */ }
+      }
+    }
+
+    // Stream fully drained — await resolves immediately with cached result
+    const result = await stream
 
     await ctx.eventLog.append('message.sent', {
       channel: 'web', to: channelId, prompt: message,

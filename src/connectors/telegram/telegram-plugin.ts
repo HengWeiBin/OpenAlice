@@ -268,9 +268,9 @@ export class TelegramPlugin implements Plugin {
       const stopTyping = this.startTypingIndicator(message.chatId)
 
       try {
-        // Route through unified provider (Engine → ProviderRouter → Vercel or Claude Code)
+        // Route through AgentCenter → GenerateRouter → active provider
         const session = await this.getSession(message.from.id)
-        const result = await engineCtx.engine.askWithSession(prompt, session, {
+        const result = await engineCtx.agentCenter.askWithSession(prompt, session, {
           historyPreamble: 'The following is the recent conversation from this Telegram chat. Use it as context if the user references earlier messages.',
         })
         stopTyping()

@@ -1,8 +1,8 @@
 /**
- * AgentSdkProvider — AIProvider backed by @anthropic-ai/claude-agent-sdk.
+ * AgentSdkProvider — GenerateProvider backed by @anthropic-ai/claude-agent-sdk.
  *
- * Thin adapter: delegates to askAgentSdkWithSession which owns the full
- * session management flow (append → compact → build <chat_history> → query → persist).
+ * Slim data-source adapter: only calls the Agent SDK and yields ProviderEvents.
+ * Session management (append, compact, persist) lives in AgentCenter.
  *
  * Reuses agent.json's `claudeCode` config block (allowedTools, disallowedTools, maxTurns)
  * since both providers are backed by the same Claude Code CLI.
@@ -10,19 +10,20 @@
 
 import { resolve } from 'node:path'
 import type { Tool } from 'ai'
-import { type AIProvider, type AskOptions, type ProviderResult, type ProviderEvent, StreamableResult } from '../../core/ai-provider.js'
-import type { SessionStore } from '../../core/session.js'
-import type { CompactionConfig } from '../../core/compaction.js'
+import type { ProviderResult, ProviderEvent } from '../../core/ai-provider.js'
+import type { GenerateProvider, GenerateInput, GenerateOpts } from '../../core/ai-provider.js'
 import type { AgentSdkConfig, AgentSdkOverride } from './query.js'
 import { readAgentConfig } from '../../core/config.js'
+import { extractMediaFromToolResultContent } from '../../core/media.js'
+import { createChannel } from '../../core/async-channel.js'
 import { askAgentSdk } from './query.js'
-import { askAgentSdkWithSession } from './session.js'
 import { buildAgentSdkMcpServer } from './tool-bridge.js'
 
-export class AgentSdkProvider implements AIProvider {
+export class AgentSdkProvider implements GenerateProvider {
+  readonly inputKind = 'text' as const
+
   constructor(
     private getTools: () => Promise<Record<string, Tool>>,
-    private compaction: CompactionConfig,
     private systemPrompt?: string,
   ) {}
 
@@ -49,31 +50,46 @@ export class AgentSdkProvider implements AIProvider {
     return { text: result.text, media: [] }
   }
 
-  askWithSession(prompt: string, session: SessionStore, opts?: AskOptions): StreamableResult {
-    const self = this
-    async function* generate(): AsyncGenerator<ProviderEvent> {
-      const config = await self.resolveConfig()
+  async *generate(input: GenerateInput, opts?: GenerateOpts): AsyncGenerator<ProviderEvent> {
+    if (input.kind !== 'text') throw new Error('AgentSdkProvider expects text input')
 
-      // Merge per-channel disabledTools with global disallowedTools
-      const agentSdk: AgentSdkConfig = opts?.disabledTools?.length
-        ? { ...config, disallowedTools: [...(config.disallowedTools ?? []), ...opts.disabledTools] }
-        : config
-
-      // Per-channel override (model/apiKey/baseUrl)
-      const override: AgentSdkOverride | undefined = opts?.agentSdk
-
-      const mcpServer = await self.buildMcpServer(opts?.disabledTools)
-
-      yield* askAgentSdkWithSession(prompt, session, {
-        agentSdk,
-        compaction: self.compaction,
-        historyPreamble: opts?.historyPreamble,
-        systemPrompt: opts?.systemPrompt ?? self.systemPrompt,
-        maxHistoryEntries: opts?.maxHistoryEntries,
-        override,
-        mcpServer,
-      })
+    const config = await this.resolveConfig()
+    const agentSdkConfig: AgentSdkConfig = {
+      ...config,
+      ...(opts?.disabledTools?.length
+        ? { disallowedTools: [...(config.disallowedTools ?? []), ...opts.disabledTools] }
+        : {}),
+      systemPrompt: input.systemPrompt ?? this.systemPrompt,
     }
-    return new StreamableResult(generate())
+
+    const override: AgentSdkOverride | undefined = opts?.agentSdk
+    const mcpServer = await this.buildMcpServer(opts?.disabledTools)
+
+    const channel = createChannel<ProviderEvent>()
+    const media: import('../../core/types.js').MediaAttachment[] = []
+
+    const resultPromise = askAgentSdk(
+      input.prompt,
+      {
+        ...agentSdkConfig,
+        onToolUse: ({ id, name, input: toolInput }) => {
+          channel.push({ type: 'tool_use', id, name, input: toolInput })
+        },
+        onToolResult: ({ toolUseId, content }) => {
+          media.push(...extractMediaFromToolResultContent(content))
+          channel.push({ type: 'tool_result', tool_use_id: toolUseId, content })
+        },
+      },
+      override,
+      mcpServer,
+    )
+
+    resultPromise.then(() => channel.close()).catch((err) => channel.error(err instanceof Error ? err : new Error(String(err))))
+    yield* channel
+
+    const result = await resultPromise
+    const prefix = result.ok ? '' : '[error] '
+    yield { type: 'done', result: { text: prefix + result.text, media } }
   }
+
 }

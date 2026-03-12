@@ -1,6 +1,6 @@
 import { readFile, writeFile, appendFile, mkdir } from 'fs/promises'
 import { resolve, dirname } from 'path'
-import { Engine } from './core/engine.js'
+// Engine removed — AgentCenter is the top-level AI entry point
 import { loadConfig, loadTradingConfig } from './core/config.js'
 import type { Plugin, EngineContext, ReconnectResult } from './core/types.js'
 import { McpPlugin } from './plugins/mcp.js'
@@ -39,7 +39,7 @@ import { SessionStore } from './core/session.js'
 import { ConnectorCenter } from './core/connector-center.js'
 import { ToolCenter } from './core/tool-center.js'
 import { AgentCenter } from './core/agent-center.js'
-import { ProviderRouter } from './core/ai-provider.js'
+import { GenerateRouter } from './core/ai-provider.js'
 import { VercelAIProvider } from './ai-providers/vercel-ai-sdk/vercel-provider.js'
 import { ClaudeCodeProvider } from './ai-providers/claude-code/claude-code-provider.js'
 import { AgentSdkProvider } from './ai-providers/agent-sdk/agent-sdk-provider.js'
@@ -297,18 +297,18 @@ async function main() {
     () => toolCenter.getVercelTools(),
     instructions,
     config.agent.maxSteps,
-    config.compaction,
   )
-  const claudeCodeProvider = new ClaudeCodeProvider(config.compaction, instructions)
+  const claudeCodeProvider = new ClaudeCodeProvider(instructions)
   const agentSdkProvider = new AgentSdkProvider(
     () => toolCenter.getVercelTools(),
-    config.compaction,
     instructions,
   )
-  const router = new ProviderRouter(vercelProvider, claudeCodeProvider, agentSdkProvider)
+  const router = new GenerateRouter(vercelProvider, claudeCodeProvider, agentSdkProvider)
 
-  const agentCenter = new AgentCenter(router)
-  const engine = new Engine({ agentCenter })
+  const agentCenter = new AgentCenter({
+    router,
+    compaction: config.compaction,
+  })
 
   // ==================== Connector Center ====================
 
@@ -319,7 +319,7 @@ async function main() {
   await cronEngine.start()
   const cronSession = new SessionStore('cron/default')
   await cronSession.restore()
-  const cronListener = createCronListener({ connectorCenter, eventLog, engine, session: cronSession })
+  const cronListener = createCronListener({ connectorCenter, eventLog, agentCenter, session: cronSession })
   cronListener.start()
   console.log('cron: engine + listener started')
 
@@ -327,7 +327,7 @@ async function main() {
 
   const heartbeat = createHeartbeat({
     config: config.heartbeat,
-    connectorCenter, cronEngine, eventLog, engine,
+    connectorCenter, cronEngine, eventLog, agentCenter,
   })
   await heartbeat.start()
   if (config.heartbeat.enabled) {
@@ -500,7 +500,7 @@ async function main() {
   // ==================== Engine Context ====================
 
   const ctx: EngineContext = {
-    config, connectorCenter, engine, eventLog, heartbeat, cronEngine, toolCenter,
+    config, connectorCenter, agentCenter, eventLog, heartbeat, cronEngine, toolCenter,
     accountManager,
     getAccountGit: (id: string): ITradingGit | undefined => accountSetups.get(id)?.git,
     reconnectAccount,
