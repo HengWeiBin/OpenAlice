@@ -29,7 +29,7 @@ function makeAgent(text = 'ok', steps: any[] = []) {
 
 function makeProvider(overrides?: { getTools?: () => Promise<Record<string, any>> }) {
   const getTools = overrides?.getTools ?? (async () => ({ toolA: {}, toolB: {} }))
-  return new VercelAIProvider(getTools as any, 'You are a trading assistant.', 10)
+  return new VercelAIProvider(getTools as any, async () => 'You are a trading assistant.', 10)
 }
 
 // ==================== resolveAgent caching ====================
@@ -65,7 +65,7 @@ describe('VercelAIProvider — agent caching', () => {
 
   it('recreates agent when tool count changes', async () => {
     let toolSet: Record<string, any> = { toolA: {}, toolB: {} }
-    const provider = new VercelAIProvider(async () => toolSet as any, 'prompt', 5)
+    const provider = new VercelAIProvider(async () => toolSet as any, async () => 'prompt', 5)
     await provider.ask('first')
     toolSet = { toolA: {}, toolB: {}, toolC: {} }
     await provider.ask('second')
@@ -84,7 +84,7 @@ describe('VercelAIProvider — per-request overrides', () => {
 
   it('skips cache and uses filtered tools when disabledTools provided', async () => {
     const getTools = async () => ({ toolA: {} as any, toolB: {} as any, toolC: {} as any })
-    const provider = new VercelAIProvider(getTools, 'prompt', 5)
+    const provider = new VercelAIProvider(getTools, async () => 'prompt', 5)
     // warm cache
     await provider.ask('warm')
     vi.clearAllMocks()

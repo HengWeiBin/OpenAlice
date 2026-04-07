@@ -43,7 +43,7 @@ function makeAgentCenter(overrides: MakeAgentCenterOpts = {}): AgentCenter {
   const compaction = overrides.compaction ?? DEFAULT_COMPACTION_CONFIG
 
   vi.mocked(createModelFromConfig).mockResolvedValue({ model, key: 'test:mock-model' })
-  const provider = new VercelAIProvider(async () => tools, instructions, maxSteps)
+  const provider = new VercelAIProvider(async () => tools, async () => instructions, maxSteps)
   const router = new GenerateRouter(provider, null)
 
   return new AgentCenter({ router, compaction })

@@ -98,7 +98,7 @@ async function main() {
 
   // ==================== Brain ====================
 
-  const [brainExport, persona] = await Promise.all([
+  const [brainExport] = await Promise.all([
     readFile(BRAIN_FILE, 'utf-8').then((r) => JSON.parse(r) as BrainExportState).catch(() => undefined),
     readWithDefault(PERSONA_FILE, PERSONA_DEFAULT),
     readWithDefault(HEARTBEAT_FILE, HEARTBEAT_DEFAULT),
@@ -123,17 +123,21 @@ async function main() {
     ? Brain.restore(brainExport, { onCommit: brainOnCommit })
     : new Brain({ onCommit: brainOnCommit })
 
-  const frontalLobe = brain.getFrontalLobe()
-  const emotion = brain.getEmotion().current
-  const instructions = [
-    persona,
-    '---',
-    '## Current Brain State',
-    '',
-    `**Frontal Lobe:** ${frontalLobe || '(empty)'}`,
-    '',
-    `**Emotion:** ${emotion}`,
-  ].join('\n')
+  /** Re-read persona from disk + live brain state on each request. */
+  const getInstructions = async () => {
+    const persona = await readFile(PERSONA_FILE, 'utf-8').catch(() => '')
+    const frontalLobe = brain.getFrontalLobe()
+    const emotion = brain.getEmotion().current
+    return [
+      persona,
+      '---',
+      '## Current Brain State',
+      '',
+      `**Frontal Lobe:** ${frontalLobe || '(empty)'}`,
+      '',
+      `**Emotion:** ${emotion}`,
+    ].join('\n')
+  }
 
   // ==================== Cron ====================
 
@@ -212,12 +216,12 @@ async function main() {
 
   const vercelProvider = new VercelAIProvider(
     () => toolCenter.getVercelTools(),
-    instructions,
+    getInstructions,
     config.agent.maxSteps,
   )
   const agentSdkProvider = new AgentSdkProvider(
     () => toolCenter.getVercelTools(),
-    instructions,
+    getInstructions,
   )
   const router = new GenerateRouter(vercelProvider, agentSdkProvider)
 

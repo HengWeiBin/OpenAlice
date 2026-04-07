@@ -25,7 +25,7 @@ export class AgentSdkProvider implements AIProvider {
 
   constructor(
     private getTools: () => Promise<Record<string, Tool>>,
-    private systemPrompt?: string,
+    private getSystemPrompt: () => Promise<string>,
   ) {}
 
   /** Re-read agent config from disk to pick up hot-reloaded settings. */
@@ -46,6 +46,7 @@ export class AgentSdkProvider implements AIProvider {
 
   async ask(prompt: string): Promise<ProviderResult> {
     const config = await this.resolveConfig()
+    config.systemPrompt = await this.getSystemPrompt()
     const mcpServer = await this.buildMcpServer()
     const result = await askAgentSdk(prompt, config, undefined, mcpServer)
     return { text: result.text, media: [] }
@@ -62,7 +63,7 @@ export class AgentSdkProvider implements AIProvider {
       ...(opts?.disabledTools?.length
         ? { disallowedTools: [...(config.disallowedTools ?? []), ...opts.disabledTools] }
         : {}),
-      systemPrompt: opts?.systemPrompt ?? this.systemPrompt,
+      systemPrompt: opts?.systemPrompt ?? await this.getSystemPrompt(),
     }
 
     const override: AgentSdkOverride | undefined = opts?.agentSdk

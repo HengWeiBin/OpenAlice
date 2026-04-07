@@ -22,11 +22,12 @@ export class VercelAIProvider implements AIProvider {
   private cachedKey: string | null = null
   private cachedToolCount: number = 0
   private cachedSystemPrompt: string | null = null
+  private cachedInstructions: string | null = null
   private cachedAgent: Agent | null = null
 
   constructor(
     private getTools: () => Promise<Record<string, Tool>>,
-    private instructions: string,
+    private getInstructions: () => Promise<string>,
     private maxSteps: number,
   ) {}
 
@@ -34,6 +35,7 @@ export class VercelAIProvider implements AIProvider {
   private async resolveAgent(systemPrompt?: string, disabledTools?: string[], modelOverride?: ModelOverride): Promise<Agent> {
     const { model, key } = await createModelFromConfig(modelOverride)
     const allTools = await this.getTools()
+    const instructions = await this.getInstructions()
 
     // Per-channel overrides: skip cache and create a fresh agent
     if (disabledTools?.length || modelOverride) {
@@ -41,16 +43,17 @@ export class VercelAIProvider implements AIProvider {
       const tools = disabledSet
         ? Object.fromEntries(Object.entries(allTools).filter(([name]) => !disabledSet.has(name)))
         : allTools
-      return createAgent(model, tools, systemPrompt ?? this.instructions, this.maxSteps)
+      return createAgent(model, tools, systemPrompt ?? instructions, this.maxSteps)
     }
 
     const toolCount = Object.keys(allTools).length
     const effectivePrompt = systemPrompt ?? null
-    if (key !== this.cachedKey || toolCount !== this.cachedToolCount || effectivePrompt !== this.cachedSystemPrompt) {
-      this.cachedAgent = createAgent(model, allTools, systemPrompt ?? this.instructions, this.maxSteps)
+    if (key !== this.cachedKey || toolCount !== this.cachedToolCount || effectivePrompt !== this.cachedSystemPrompt || instructions !== this.cachedInstructions) {
+      this.cachedAgent = createAgent(model, allTools, systemPrompt ?? instructions, this.maxSteps)
       this.cachedKey = key
       this.cachedToolCount = toolCount
       this.cachedSystemPrompt = effectivePrompt
+      this.cachedInstructions = instructions
       console.log(`vercel-ai: model loaded → ${key} (${toolCount} tools)`)
     }
     return this.cachedAgent!
