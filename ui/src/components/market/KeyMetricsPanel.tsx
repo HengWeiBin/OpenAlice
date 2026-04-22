@@ -70,8 +70,21 @@ export function KeyMetricsPanel({ symbol }: Props) {
     ['Enterprise V',  fmtMoneyShort(both.enterprise_value)],
   ]
 
+  // Compose a hover hint that explains where the numbers came from, which
+  // endpoints were merged, and flags provider-specific gaps the user is
+  // most likely to notice. Extend when more caveats earn a mention.
+  const infoLines: string[] = [
+    provider ? `Source: ${provider}` : 'Source: (unknown)',
+    'Endpoints: /equity/fundamental/metrics + /equity/fundamental/ratios',
+    'Values are trailing-twelve-months where applicable; market cap is live.',
+  ]
+  if (data && !data.ratios && data.metrics) {
+    infoLines.push('Note: ratios endpoint not implemented by this provider — showing metrics only.')
+  }
+  const info = infoLines.join('\n')
+
   return (
-    <Card title="Key Metrics" source={provider}>
+    <Card title="Key Metrics" info={info}>
       {loading && <div className="text-[12px] text-text-muted">Loading…</div>}
       {error && !loading && <div className="text-[12px] text-red-400">{error}</div>}
       {!loading && !error && data && (
