@@ -67,43 +67,27 @@ const sourceDesc = (required: boolean, extra?: string) => {
  * String form preserves precision beyond JS double (crypto satoshi-scale).
  * Internal pipeline wraps to Decimal regardless.
  */
+/**
+ * Positive numeric value as a decimal string. **String only** — no
+ * number accepted. Forces LLM output through Decimal serialization
+ * end-to-end so precision is preserved into the staging layer (the
+ * persisted git records, ultimately). LLMs reliably emit strings
+ * when the schema demands them; permissive `union([number, string])`
+ * is unnecessary and re-opens the precision-loss path that this
+ * whole sweep was meant to close.
+ */
 const positiveNumeric = z
-  .union([z.number(), z.string()])
+  .string()
   .refine(
     (v) => {
       try {
-        return new Decimal(String(v)).gt(0) && new Decimal(String(v)).isFinite()
+        return new Decimal(v).gt(0) && new Decimal(v).isFinite()
       } catch {
         return false
       }
     },
-    { message: 'must be a positive number or positive numeric string' },
+    { message: 'must be a positive numeric string (e.g. "0.001", "150")' },
   )
-
-/**
- * Coerce LLM-supplied numeric inputs (which may arrive as `number`)
- * into strings before forwarding into the staging layer. The staging
- * APIs are string-only so Decimal precision is preserved end-to-end;
- * this is the single conversion point at the AI tool boundary.
- *
- * Return type narrows the named fields to `string | undefined` so
- * callers can pass the result directly into staging methods without
- * an extra cast.
- */
-type Stringify<T, K extends keyof T> =
-  Omit<T, K> & { [P in K]: undefined extends T[P] ? string | undefined : string }
-
-function toStringNumerics<T extends Record<string, unknown>, K extends keyof T>(
-  params: T,
-  fields: readonly K[],
-): Stringify<T, K> {
-  const out = { ...params } as Record<string, unknown>
-  for (const f of fields) {
-    const v = out[f as string]
-    if (v != null) out[f as string] = String(v)
-  }
-  return out as Stringify<T, K>
-}
 
 export function createTradingTools(manager: UTAManager, fxService?: FxService): Record<string, Tool> {
   return {
@@ -404,9 +388,9 @@ Optional: attach takeProfit and/or stopLoss for automatic exit orders.`,
         symbol: z.string().optional().describe('Human-readable symbol (optional, for display only)'),
         action: z.enum(['BUY', 'SELL']).describe('Order direction'),
         orderType: z.enum(['MKT', 'LMT', 'STP', 'STP LMT', 'TRAIL', 'TRAIL LIMIT', 'MOC']).describe('Order type'),
-        totalQuantity: positiveNumeric.optional().describe('Number of shares/contracts (mutually exclusive with cashQty). Accepts number or decimal string.'),
+        totalQuantity: positiveNumeric.optional().describe('Number of shares/contracts as a decimal string (e.g. "0.001"). Mutually exclusive with cashQty.'),
         cashQty: positiveNumeric.optional().describe('Notional dollar amount (mutually exclusive with totalQuantity).'),
-        lmtPrice: positiveNumeric.optional().describe('Limit price (required for LMT, STP LMT, TRAIL LIMIT). Accepts number or decimal string for satoshi-scale prices.'),
+        lmtPrice: positiveNumeric.optional().describe('Limit price as a decimal string (required for LMT, STP LMT, TRAIL LIMIT). String preserves satoshi-scale precision.'),
         auxPrice: positiveNumeric.optional().describe('Stop trigger price for STP/STP LMT; trailing offset amount for TRAIL/TRAIL LIMIT.'),
         trailStopPrice: positiveNumeric.optional().describe('Initial trailing stop price (TRAIL/TRAIL LIMIT only).'),
         trailingPercent: positiveNumeric.optional().describe('Trailing stop percentage offset (alternative to auxPrice for TRAIL).'),
@@ -423,7 +407,7 @@ Optional: attach takeProfit and/or stopLoss for automatic exit orders.`,
           limitPrice: z.string().optional().describe('Limit price for stop-limit SL (omit for stop-market)'),
         }).optional().describe('Stop loss order (single-level, full quantity)'),
       }),
-      execute: ({ source, ...params }) => manager.resolveOne(source).stagePlaceOrder(toStringNumerics(params, ['totalQuantity', 'cashQty', 'lmtPrice', 'auxPrice', 'trailStopPrice', 'trailingPercent'])),
+      execute: ({ source, ...params }) => manager.resolveOne(source).stagePlaceOrder(params),
     }),
 
     modifyOrder: tool({
@@ -431,16 +415,16 @@ Optional: attach takeProfit and/or stopLoss for automatic exit orders.`,
       inputSchema: z.object({
         source: z.string().describe(sourceDesc(true)),
         orderId: z.string().describe('Order ID to modify'),
-        totalQuantity: positiveNumeric.optional().describe('New quantity. Accepts number or decimal string.'),
-        lmtPrice: positiveNumeric.optional().describe('New limit price. Accepts number or decimal string.'),
-        auxPrice: positiveNumeric.optional().describe('New stop trigger price or trailing offset (depends on order type).'),
-        trailStopPrice: positiveNumeric.optional().describe('New initial trailing stop price.'),
-        trailingPercent: positiveNumeric.optional().describe('New trailing stop percentage.'),
+        totalQuantity: positiveNumeric.optional().describe('New quantity. Decimal string (e.g. "0.001").'),
+        lmtPrice: positiveNumeric.optional().describe('New limit price. Decimal string.'),
+        auxPrice: positiveNumeric.optional().describe('New stop trigger price or trailing offset (depends on order type). Decimal string.'),
+        trailStopPrice: positiveNumeric.optional().describe('New initial trailing stop price. Decimal string.'),
+        trailingPercent: positiveNumeric.optional().describe('New trailing stop percentage. Decimal string.'),
         orderType: z.enum(['MKT', 'LMT', 'STP', 'STP LMT', 'TRAIL', 'TRAIL LIMIT', 'MOC']).optional().describe('New order type'),
         tif: z.enum(['DAY', 'GTC', 'IOC', 'FOK', 'OPG', 'GTD']).optional().describe('New time in force'),
         goodTillDate: z.string().optional().describe('New expiration date'),
       }),
-      execute: ({ source, ...params }) => manager.resolveOne(source).stageModifyOrder(toStringNumerics(params, ['totalQuantity', 'lmtPrice', 'auxPrice', 'trailStopPrice', 'trailingPercent'])),
+      execute: ({ source, ...params }) => manager.resolveOne(source).stageModifyOrder(params),
     }),
 
     closePosition: tool({
@@ -449,9 +433,9 @@ Optional: attach takeProfit and/or stopLoss for automatic exit orders.`,
         source: z.string().describe(sourceDesc(true)),
         aliceId: z.string().describe('Contract ID (format: accountId|nativeKey, from searchContracts)'),
         symbol: z.string().optional().describe('Human-readable symbol. Optional.'),
-        qty: positiveNumeric.optional().describe('Number of shares to sell. Accepts number or decimal string. Default: sell all.'),
+        qty: positiveNumeric.optional().describe('Number of shares to sell. Decimal string. Default: sell all.'),
       }),
-      execute: ({ source, ...params }) => manager.resolveOne(source).stageClosePosition(toStringNumerics(params, ['qty'])),
+      execute: ({ source, ...params }) => manager.resolveOne(source).stageClosePosition(params),
     }),
 
     cancelOrder: tool({
