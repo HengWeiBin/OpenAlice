@@ -29,6 +29,7 @@ export class TelegramPlugin implements Plugin {
   private agentSdkConfig: AgentSdkConfig
   private bot: Bot | null = null
   private connectorCenter: ConnectorCenter | null = null
+  private ctx: EngineContext | null = null
   private merger: MediaGroupMerger | null = null
   private unregisterConnector?: () => void
 
@@ -48,6 +49,7 @@ export class TelegramPlugin implements Plugin {
   }
 
   async start(engineCtx: EngineContext) {
+    this.ctx = engineCtx
     this.connectorCenter = engineCtx.connectorCenter
     this.webPort = engineCtx.config.connectors.web.port
 
@@ -323,13 +325,7 @@ export class TelegramPlugin implements Plugin {
     const session = await this.getSession(userId)
     await this.sendReply(chatId, '> Compacting session...')
 
-    const result = await forceCompact(
-      session,
-      async (summarizePrompt) => {
-        const r = await askAgentSdk(summarizePrompt, { ...this.agentSdkConfig, maxTurns: 1 })
-        return r.text
-      },
-    )
+    const result = await this.ctx!.agentCenter.forceCompact(session)
 
     if (!result) {
       await this.sendReply(chatId, 'Session is empty, nothing to compact.')
