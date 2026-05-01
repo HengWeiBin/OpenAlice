@@ -14,7 +14,7 @@ import { z } from 'zod'
 
 // ==================== Types ====================
 
-export type BrokerEngine = 'ccxt' | 'alpaca' | 'ibkr' | 'leverup'
+export type BrokerEngine = 'ccxt' | 'alpaca' | 'ibkr' | 'leverup' | 'longbridge'
 
 export interface ModeOption {
   id: string
@@ -323,6 +323,40 @@ export const IBKR_PRESET: BrokerPresetDef = {
   isPaper: (d) => Number(d.port) === 7497 || Number(d.port) === 4002,
 }
 
+export const LONGBRIDGE_PRESET: BrokerPresetDef = {
+  id: 'longbridge',
+  label: 'Longbridge (HK / US / CN / SG)',
+  description: 'Longbridge OpenAPI — multi-region broker for HK, US, CN A-shares (via Stock Connect), and SG equities under one account.',
+  category: 'securities',
+  hint: 'Longbridge uses **appKey + appSecret + accessToken** from open.longbridge.com. The access token is long-lived (~90 days) but **does not auto-refresh** — when it expires you must regenerate it in the LB dashboard and update this config. Paper and live use separate credentials; generate from the matching environment.',
+  defaultName: 'longbridge-main',
+  badge: 'LB',
+  badgeColor: 'text-accent',
+  engine: 'longbridge',
+  guardCategory: 'securities',
+  modes: [
+    { id: 'live', label: 'Live Trading' },
+    { id: 'paper', label: 'Paper Trading' },
+  ],
+  zodSchema: z.object({
+    mode: z.enum(['live', 'paper']).default('live').describe('Mode'),
+    appKey: z.string().min(1).describe('App Key'),
+    appSecret: z.string().min(1).describe('App Secret'),
+    accessToken: z.string().min(1).describe('Access Token'),
+  }),
+  subtitleFields: [
+    { field: 'mode', prefix: 'Longbridge · ' },
+  ],
+  writeOnlyFields: ['appKey', 'appSecret', 'accessToken'],
+  toEngineConfig: (d) => ({
+    appKey: d.appKey,
+    appSecret: d.appSecret,
+    accessToken: d.accessToken,
+    paper: d.mode === 'paper',
+  }),
+  isPaper: (d) => d.mode === 'paper',
+}
+
 // ==================== Other ecosystem brokers (lower-tier, isolated) ====================
 
 export const LEVERUP_PRESET: BrokerPresetDef = {
@@ -368,6 +402,7 @@ export const BROKER_PRESET_CATALOG: BrokerPresetDef[] = [
   // Securities
   ALPACA_PRESET,
   IBKR_PRESET,
+  LONGBRIDGE_PRESET,
   // Other ecosystem (favor-return tier)
   LEVERUP_PRESET,
   // Escape hatch (untested exchanges)

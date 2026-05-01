@@ -15,6 +15,7 @@ import { CcxtBroker } from './ccxt/CcxtBroker.js'
 import { AlpacaBroker } from './alpaca/AlpacaBroker.js'
 import { IbkrBroker } from './ibkr/IbkrBroker.js'
 import { LeverupBroker } from './others/leverup/index.js'
+import { LongbridgeBroker } from './longbridge/index.js'
 import type { BrokerEngine } from './preset-catalog.js'
 
 /** Minimal engine entry: just enough to validate + instantiate. */
@@ -41,5 +42,9 @@ export const BROKER_ENGINE_REGISTRY: Record<BrokerEngine, BrokerEngineEntry> = {
   leverup: {
     configSchema: LeverupBroker.configSchema,
     fromConfig: LeverupBroker.fromConfig,
+  },
+  longbridge: {
+    configSchema: LongbridgeBroker.configSchema,
+    fromConfig: LongbridgeBroker.fromConfig,
   },
 }
