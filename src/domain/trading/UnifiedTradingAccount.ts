@@ -359,6 +359,31 @@ export class UnifiedTradingAccount {
     contract.aliceId = `${this.id}|${nativeKey}`
   }
 
+  /**
+   * Reverse of `stampAliceId`: parse an aliceId, verify it belongs to this
+   * UTA, and rebuild the full Contract via the broker's native-key resolver.
+   * Throws on malformed input or cross-UTA mismatch — those are caller bugs
+   * (AI passing an aliceId from a different account, or stale state) and
+   * should surface loudly rather than silently no-op.
+   *
+   * Use this whenever an AI tool or HTTP route receives an aliceId from the
+   * outside and needs to call a broker read API (getQuote, getOrderBook,
+   * getFundingRate, getContractDetails). The staging methods below also
+   * funnel through here for consistency.
+   */
+  contractFromAliceId(aliceId: string): Contract {
+    const parsed = UnifiedTradingAccount.parseAliceId(aliceId)
+    if (!parsed) {
+      throw new Error(`Invalid aliceId "${aliceId}". Use searchContracts to get a valid contract identifier (expected format: "accountId|nativeKey").`)
+    }
+    if (parsed.utaId !== this.id) {
+      throw new Error(`aliceId "${aliceId}" belongs to UTA "${parsed.utaId}", not "${this.id}".`)
+    }
+    const contract = this.broker.resolveNativeKey(parsed.nativeKey)
+    contract.aliceId = aliceId
+    return contract
+  }
+
   /** Parse aliceId → { utaId, nativeKey }, or null if invalid. */
   static parseAliceId(aliceId: string): { utaId: string; nativeKey: string } | null {
     const sep = aliceId.indexOf('|')
