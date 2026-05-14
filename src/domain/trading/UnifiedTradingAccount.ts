@@ -331,6 +331,28 @@ export class UnifiedTradingAccount {
 
   // ==================== aliceId management ====================
 
+  /**
+   * Resolve a Contract to its full broker-native form.
+   * If contract.aliceId is present but native fields (conId, localSymbol) are
+   * missing, it parses the nativeKey from aliceId and asks the broker to resolve it.
+   */
+  resolveContract(contract: Contract): Contract {
+    if (contract.aliceId && !contract.conId && !contract.localSymbol) {
+      const parsed = UnifiedTradingAccount.parseAliceId(contract.aliceId)
+      if (parsed && parsed.utaId === this.id) {
+        const resolved = this.broker.resolveNativeKey(parsed.nativeKey)
+        // Copy resolved fields into original object to preserve reference
+        contract.conId = resolved.conId
+        contract.localSymbol = resolved.localSymbol
+        contract.symbol = contract.symbol || resolved.symbol
+        contract.secType = contract.secType || resolved.secType
+        contract.currency = contract.currency || resolved.currency
+        contract.exchange = contract.exchange || resolved.exchange
+      }
+    }
+    return contract
+  }
+
   /** Construct aliceId: "{utaId}|{nativeKey}" using broker's native identity. */
   private stampAliceId(contract: Contract): void {
     const nativeKey = this.broker.getNativeKey(contract)
@@ -344,36 +366,16 @@ export class UnifiedTradingAccount {
     return { utaId: aliceId.slice(0, sep), nativeKey: aliceId.slice(sep + 1) }
   }
 
-  /**
-   * Reverse of `stampAliceId`: parse an aliceId, verify it belongs to this
-   * UTA, and rebuild the full Contract via the broker's native-key resolver.
-   * Throws on malformed input or cross-UTA mismatch — those are caller bugs
-   * (AI passing an aliceId from a different account, or stale state) and
-   * should surface loudly rather than silently no-op.
-   *
-   * Use this whenever an AI tool or HTTP route receives an aliceId from the
-   * outside and needs to call a broker read API (getQuote, getOrderBook,
-   * getFundingRate, getContractDetails). The staging methods below also
-   * funnel through here for consistency.
-   */
-  contractFromAliceId(aliceId: string): Contract {
-    const parsed = UnifiedTradingAccount.parseAliceId(aliceId)
-    if (!parsed) {
-      throw new Error(`Invalid aliceId "${aliceId}". Use searchContracts to get a valid contract identifier (expected format: "accountId|nativeKey").`)
-    }
-    if (parsed.utaId !== this.id) {
-      throw new Error(`aliceId "${aliceId}" belongs to UTA "${parsed.utaId}", not "${this.id}".`)
-    }
-    const contract = this.broker.resolveNativeKey(parsed.nativeKey)
-    contract.aliceId = aliceId
-    return contract
-  }
-
   // ==================== Stage operations ====================
 
   stagePlaceOrder(params: StagePlaceOrderParams): AddResult {
     // Resolve aliceId → full contract via broker (fills secType, exchange, currency, conId, etc.)
-    const contract = this.contractFromAliceId(params.aliceId)
+    const parsed = UnifiedTradingAccount.parseAliceId(params.aliceId)
+    if (!parsed) {
+      throw new Error(`Invalid aliceId "${params.aliceId}". Use searchContracts to get a valid contract identifier (expected format: "accountId|nativeKey").`)
+    }
+    const contract = this.broker.resolveNativeKey(parsed.nativeKey)
+    contract.aliceId = params.aliceId
     if (params.symbol) contract.symbol = params.symbol
 
     const order = new Order()
@@ -415,7 +417,12 @@ export class UnifiedTradingAccount {
   }
 
   stageClosePosition(params: StageClosePositionParams): AddResult {
-    const contract = this.contractFromAliceId(params.aliceId)
+    const parsed = UnifiedTradingAccount.parseAliceId(params.aliceId)
+    if (!parsed) {
+      throw new Error(`Invalid aliceId "${params.aliceId}". Use searchContracts to get a valid contract identifier (expected format: "accountId|nativeKey").`)
+    }
+    const contract = this.broker.resolveNativeKey(parsed.nativeKey)
+    contract.aliceId = params.aliceId
     if (params.symbol) contract.symbol = params.symbol
 
     return this.git.add({
@@ -620,6 +627,7 @@ export class UnifiedTradingAccount {
   }
 
   async getQuote(contract: Contract): Promise<Quote> {
+    this.resolveContract(contract)
     const quote = await this._callBroker(() => this.broker.getQuote(contract))
     this.stampAliceId(quote.contract)
     return quote
@@ -648,6 +656,7 @@ export class UnifiedTradingAccount {
   }
 
   async getContractDetails(query: Contract): Promise<ContractDetails | null> {
+    this.resolveContract(query)
     const details = await this._callBroker(() => this.broker.getContractDetails(query))
     if (details) this.stampAliceId(details.contract)
     return details
