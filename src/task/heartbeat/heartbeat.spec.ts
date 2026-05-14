@@ -1,19 +1,24 @@
 /**
- * Heartbeat tests — Pump-driven trigger source.
+ * Heartbeat tests — exercises the full trigger-source pipeline:
  *
- * Post-Pump refactor, heartbeat no longer subscribes to cron.fire.
- * It owns a private Pump. Tests trigger ticks via `heartbeat.runNow()`
- * (which delegates to `pump.runNow()`) rather than `cronEngine.runNow()`.
+ *   cron.fire (__heartbeat__)
+ *     → handleFire()
+ *       → AgentWorkRunner.run()
+ *         → inputGate (active-hours)
+ *         → AI invocation
+ *         → outputGate (notify_user inspection + dedup)
+ *         → connectorCenter.notify (optional)
+ *         → emit done / skip / error
  *
- * The full pipeline test path:
- *   heartbeat.runNow()
- *     → pump.runNow() → onTick
- *     → active-hours pre-filter (skip → emit agent.work.skip directly)
- *     → producer.emit('agent.work.requested') for the canonical event
- *   → agent-work-listener picks up the request
- *     → source-config-driven AgentWorkRunner.run()
- *     → notify_user inspection + dedup gate
- *     → emit agent.work.{done,skip,error}
+ * The legacy STATUS regex protocol is gone. Heartbeat now signals
+ * notification intent via the `notify_user` tool — these tests mock
+ * the AgentCenter result to include or omit the tool call, and assert
+ * on the resulting events.
+ *
+ * AgentWork primitive coverage lives in `src/core/agent-work.spec.ts`;
+ * this file tests heartbeat-specific behaviours: cron job lifecycle,
+ * active-hours filtering, dedup window, hot enable/disable, and the
+ * heartbeat-specific outputGate semantics.
  */
 
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
@@ -22,10 +27,12 @@ import { tmpdir } from 'node:os'
 import { randomUUID } from 'node:crypto'
 import { createEventLog, type EventLog } from '../../core/event-log.js'
 import { createListenerRegistry, type ListenerRegistry } from '../../core/listener-registry.js'
+import { createCronEngine, type CronEngine } from '../cron/engine.js'
 import {
   createHeartbeat,
   isWithinActiveHours,
   HeartbeatDedup,
+  HEARTBEAT_JOB_NAME,
   type Heartbeat,
   type HeartbeatConfig,
 } from './heartbeat.js'
@@ -33,14 +40,9 @@ import { SessionStore } from '../../core/session.js'
 import { ConnectorCenter } from '../../core/connector-center.js'
 import { createMemoryNotificationsStore } from '../../core/notifications-store.js'
 import { AgentWorkRunner } from '../../core/agent-work.js'
-import { createAgentWorkListener, type AgentWorkListener } from '../../core/agent-work-listener.js'
 import type { ToolCallSummary } from '../../ai-providers/types.js'
-import type {
-  AgentWorkDonePayload,
-  AgentWorkSkipPayload,
-  AgentWorkErrorPayload,
-} from '../../core/agent-event.js'
 
+// Mock writeConfigSection to avoid disk writes in tests
 vi.mock('../../core/config.js', () => ({
   writeConfigSection: vi.fn(async () => ({})),
 }))
@@ -60,6 +62,10 @@ function makeConfig(overrides: Partial<HeartbeatConfig> = {}): HeartbeatConfig {
 }
 
 // ==================== Mock Engine ====================
+//
+// Returns `{ text, media, toolCalls }` from `askWithSession`. The
+// runner unwraps these as ProviderResult; toolCalls is what the
+// heartbeat outputGate inspects for notify_user invocations.
 
 interface MockEngineState {
   text: string
@@ -74,14 +80,21 @@ function createMockEngine(initial: Partial<MockEngineState> = {}) {
     shouldThrow: null,
     ...initial,
   }
+
   return {
     state,
     setNotifyUserCall(text: string) {
       state.toolCalls = [{ id: randomUUID(), name: 'notify_user', input: { text } }]
     },
-    setNoToolCall() { state.toolCalls = [] },
-    setRawText(text: string) { state.text = text },
-    setShouldThrow(err: Error | null) { state.shouldThrow = err },
+    setNoToolCall() {
+      state.toolCalls = []
+    },
+    setRawText(text: string) {
+      state.text = text
+    },
+    setShouldThrow(err: Error | null) {
+      state.shouldThrow = err
+    },
     askWithSession: vi.fn(async () => {
       if (state.shouldThrow) throw state.shouldThrow
       return { text: state.text, media: [], toolCalls: state.toolCalls }
@@ -95,63 +108,94 @@ function createMockEngine(initial: Partial<MockEngineState> = {}) {
 describe('heartbeat', () => {
   let eventLog: EventLog
   let listenerRegistry: ListenerRegistry
+  let cronEngine: CronEngine
   let heartbeat: Heartbeat
   let mockEngine: ReturnType<typeof createMockEngine>
   let session: SessionStore
   let connectorCenter: ConnectorCenter
   let notificationsStore: ReturnType<typeof createMemoryNotificationsStore>
-  let agentWorkListener: AgentWorkListener
+  let agentWorkRunner: AgentWorkRunner
 
   beforeEach(async () => {
-    eventLog = await createEventLog({ logPath: tempPath('jsonl') })
+    const logPath = tempPath('jsonl')
+    const storePath = tempPath('json')
+    eventLog = await createEventLog({ logPath })
     listenerRegistry = createListenerRegistry(eventLog)
     await listenerRegistry.start()
+    cronEngine = createCronEngine({ registry: listenerRegistry, storePath })
+    await cronEngine.start()
 
     mockEngine = createMockEngine()
     session = new SessionStore(`test/heartbeat-${randomUUID()}`)
     notificationsStore = createMemoryNotificationsStore()
     connectorCenter = new ConnectorCenter({ notificationsStore })
-    const runner = new AgentWorkRunner({
+    agentWorkRunner = new AgentWorkRunner({
       agentCenter: mockEngine as never,
       connectorCenter,
     })
-    agentWorkListener = createAgentWorkListener({ runner, registry: listenerRegistry })
-    await agentWorkListener.start()
   })
 
   afterEach(async () => {
     heartbeat?.stop()
-    agentWorkListener.stop()
+    cronEngine.stop()
     await listenerRegistry.stop()
     await eventLog._resetForTest()
   })
 
-  // ==================== Lifecycle ====================
+  // ==================== Start / Idempotency ====================
 
-  describe('lifecycle', () => {
-    it('start() is idempotent', async () => {
+  describe('start', () => {
+    it('should register a cron job on start', async () => {
       heartbeat = createHeartbeat({
         config: makeConfig(),
-        agentWorkListener, registry: listenerRegistry, session,
+        agentWorkRunner, cronEngine, registry: listenerRegistry, session,
       })
+
       await heartbeat.start()
-      await heartbeat.start()  // no error
+
+      const jobs = cronEngine.list()
+      expect(jobs).toHaveLength(1)
+      expect(jobs[0].name).toBe(HEARTBEAT_JOB_NAME)
+      expect(jobs[0].schedule).toEqual({ kind: 'every', every: '30m' })
     })
 
-    it('start() respects config.enabled', async () => {
+    it('should be idempotent (update existing job, not create duplicate)', async () => {
       heartbeat = createHeartbeat({
-        config: makeConfig({ enabled: false }),
-        agentWorkListener, registry: listenerRegistry, session,
+        config: makeConfig({ every: '30m' }),
+        agentWorkRunner, cronEngine, registry: listenerRegistry, session,
       })
       await heartbeat.start()
+      heartbeat.stop()
+
+      heartbeat = createHeartbeat({
+        config: makeConfig({ every: '1h' }),
+        agentWorkRunner, cronEngine, registry: listenerRegistry, session,
+      })
+      await heartbeat.start()
+
+      const jobs = cronEngine.list()
+      expect(jobs).toHaveLength(1)
+      expect(jobs[0].schedule).toEqual({ kind: 'every', every: '1h' })
+    })
+
+    it('should register disabled job when config.enabled is false', async () => {
+      heartbeat = createHeartbeat({
+        config: makeConfig({ enabled: false }),
+        agentWorkRunner, cronEngine, registry: listenerRegistry, session,
+      })
+      await heartbeat.start()
+
+      const jobs = cronEngine.list()
+      expect(jobs).toHaveLength(1)
+      expect(jobs[0].enabled).toBe(false)
       expect(heartbeat.isEnabled()).toBe(false)
     })
   })
 
-  // ==================== Event Handling ====================
+  // ==================== Event Handling: notify_user contract ====================
 
   describe('event handling', () => {
-    it('delivers when AI calls notify_user', async () => {
+    it('delivers when AI invokes notify_user', async () => {
       const delivered: string[] = []
       notificationsStore.onAppended((entry) => { delivered.push(entry.text) })
 
@@ -159,40 +203,44 @@ describe('heartbeat', () => {
 
       heartbeat = createHeartbeat({
         config: makeConfig(),
-        agentWorkListener, registry: listenerRegistry, session,
+        agentWorkRunner, cronEngine, registry: listenerRegistry, session,
       })
       await heartbeat.start()
-      await heartbeat.runNow()
+
+      await cronEngine.runNow(cronEngine.list()[0].id)
 
       await vi.waitFor(() => {
-        expect(eventLog.recent({ type: 'agent.work.done' })).toHaveLength(1)
+        expect(eventLog.recent({ type: 'heartbeat.done' })).toHaveLength(1)
       })
 
       expect(delivered).toEqual(['BTC dropped 5% to $87,200'])
-      const done = eventLog.recent({ type: 'agent.work.done' })[0].payload as AgentWorkDonePayload
-      expect(done.source).toBe('heartbeat')
-      expect(done.delivered).toBe(true)
+      const done = eventLog.recent({ type: 'heartbeat.done' })
+      expect(done[0].payload).toMatchObject({
+        reply: 'BTC dropped 5% to $87,200',
+        delivered: true,
+      })
     })
 
     it('skips with reason=ack when AI does not call notify_user', async () => {
-      mockEngine.setRawText('Checked, nothing notable.')
+      mockEngine.setRawText('Checked. Nothing notable in the last 30 minutes.')
       mockEngine.setNoToolCall()
 
       heartbeat = createHeartbeat({
         config: makeConfig(),
-        agentWorkListener, registry: listenerRegistry, session,
+        agentWorkRunner, cronEngine, registry: listenerRegistry, session,
       })
       await heartbeat.start()
-      await heartbeat.runNow()
+
+      await cronEngine.runNow(cronEngine.list()[0].id)
 
       await vi.waitFor(() => {
-        expect(eventLog.recent({ type: 'agent.work.skip' })).toHaveLength(1)
+        expect(eventLog.recent({ type: 'heartbeat.skip' })).toHaveLength(1)
       })
 
-      const skip = eventLog.recent({ type: 'agent.work.skip' })[0].payload as AgentWorkSkipPayload
-      expect(skip.source).toBe('heartbeat')
-      expect(skip.reason).toBe('ack')
-      expect(eventLog.recent({ type: 'agent.work.done' })).toHaveLength(0)
+      const skips = eventLog.recent({ type: 'heartbeat.skip' })
+      expect(skips[0].payload).toMatchObject({ reason: 'ack' })
+      // No notify, no done
+      expect(eventLog.recent({ type: 'heartbeat.done' })).toHaveLength(0)
     })
 
     it('skips with reason=empty when notify_user.text is blank', async () => {
@@ -200,52 +248,52 @@ describe('heartbeat', () => {
 
       heartbeat = createHeartbeat({
         config: makeConfig(),
-        agentWorkListener, registry: listenerRegistry, session,
+        agentWorkRunner, cronEngine, registry: listenerRegistry, session,
       })
       await heartbeat.start()
-      await heartbeat.runNow()
+
+      await cronEngine.runNow(cronEngine.list()[0].id)
 
       await vi.waitFor(() => {
-        expect(eventLog.recent({ type: 'agent.work.skip' })).toHaveLength(1)
+        expect(eventLog.recent({ type: 'heartbeat.skip' })).toHaveLength(1)
       })
 
-      const skip = eventLog.recent({ type: 'agent.work.skip' })[0].payload as AgentWorkSkipPayload
-      expect(skip.reason).toBe('empty')
+      expect((eventLog.recent({ type: 'heartbeat.skip' })[0].payload as { reason: string }).reason).toBe('empty')
     })
 
-    it('does NOT regex-parse STATUS-shaped raw text — anti-regression', async () => {
-      mockEngine.setRawText('STATUS: CHAT_YES\nCONTENT: should NOT be delivered')
+    it('does NOT regex-parse the AI response — STATUS-shaped text without notify_user is still skipped', async () => {
+      // Old protocol response — must NOT trigger any notification under
+      // the new contract. The AI must call the tool to deliver.
+      mockEngine.setRawText('STATUS: CHAT_YES\nREASON: x\nCONTENT: this should NOT be delivered')
       mockEngine.setNoToolCall()
 
       heartbeat = createHeartbeat({
         config: makeConfig(),
-        agentWorkListener, registry: listenerRegistry, session,
+        agentWorkRunner, cronEngine, registry: listenerRegistry, session,
       })
       await heartbeat.start()
-      await heartbeat.runNow()
+
+      await cronEngine.runNow(cronEngine.list()[0].id)
 
       await vi.waitFor(() => {
-        expect(eventLog.recent({ type: 'agent.work.skip' })).toHaveLength(1)
+        expect(eventLog.recent({ type: 'heartbeat.skip' })).toHaveLength(1)
       })
 
       const { entries } = await notificationsStore.read()
       expect(entries).toHaveLength(0)
     })
 
-    it('no longer subscribes to cron.fire (decoupled from cron-engine)', async () => {
+    it('ignores non-heartbeat cron.fire events', async () => {
       heartbeat = createHeartbeat({
         config: makeConfig(),
-        agentWorkListener, registry: listenerRegistry, session,
+        agentWorkRunner, cronEngine, registry: listenerRegistry, session,
       })
       await heartbeat.start()
 
-      // Fire a cron.fire event with the legacy __heartbeat__ jobName.
-      // Pre-refactor, this would have driven heartbeat. Post-refactor,
-      // heartbeat is fully decoupled — no AI call should happen.
       await eventLog.append('cron.fire', {
-        jobId: 'legacy-id',
-        jobName: '__heartbeat__',
-        payload: 'should be ignored',
+        jobId: 'other-job',
+        jobName: 'check-eth',
+        payload: 'Check ETH price',
       })
       await new Promise((r) => setTimeout(r, 50))
 
@@ -256,30 +304,27 @@ describe('heartbeat', () => {
   // ==================== Active Hours ====================
 
   describe('active hours', () => {
-    it('emits agent.work.skip with reason=outside-active-hours, without invoking AI', async () => {
+    it('skips when outside active hours, without invoking AI', async () => {
       const fakeNow = new Date('2025-06-15T03:00:00').getTime() // 3 AM local
 
       heartbeat = createHeartbeat({
         config: makeConfig({
           activeHours: { start: '09:00', end: '22:00', timezone: 'local' },
         }),
-        agentWorkListener, registry: listenerRegistry, session,
+        agentWorkRunner, cronEngine, registry: listenerRegistry, session,
         now: () => fakeNow,
       })
       await heartbeat.start()
-      await heartbeat.runNow()
+
+      await cronEngine.runNow(cronEngine.list()[0].id)
 
       await vi.waitFor(() => {
-        expect(eventLog.recent({ type: 'agent.work.skip' })).toHaveLength(1)
+        expect(eventLog.recent({ type: 'heartbeat.skip' })).toHaveLength(1)
       })
 
-      const skip = eventLog.recent({ type: 'agent.work.skip' })[0].payload as AgentWorkSkipPayload
-      expect(skip.source).toBe('heartbeat')
-      expect(skip.reason).toBe('outside-active-hours')
+      const skips = eventLog.recent({ type: 'heartbeat.skip' })
+      expect((skips[0].payload as { reason: string }).reason).toBe('outside-active-hours')
       expect(mockEngine.askWithSession).not.toHaveBeenCalled()
-      // No agent.work.requested emitted (pre-emit gate)
-      const reqs = eventLog.recent({ type: 'agent.work.requested' })
-      expect(reqs.filter(e => (e.payload as { source: string }).source === 'heartbeat')).toHaveLength(0)
     })
   })
 
@@ -294,19 +339,23 @@ describe('heartbeat', () => {
 
       heartbeat = createHeartbeat({
         config: makeConfig(),
-        agentWorkListener, registry: listenerRegistry, session,
+        agentWorkRunner, cronEngine, registry: listenerRegistry, session,
       })
       await heartbeat.start()
 
-      await heartbeat.runNow()
+      const jobId = cronEngine.list()[0].id
+
+      // First fire — delivered
+      await cronEngine.runNow(jobId)
       await vi.waitFor(() => {
-        expect(eventLog.recent({ type: 'agent.work.done' })).toHaveLength(1)
+        expect(eventLog.recent({ type: 'heartbeat.done' })).toHaveLength(1)
       })
 
-      await heartbeat.runNow()
+      // Second fire (same notify_user text) — should be deduped
+      await cronEngine.runNow(jobId)
       await vi.waitFor(() => {
-        const skips = eventLog.recent({ type: 'agent.work.skip' })
-        expect(skips.some(s => (s.payload as AgentWorkSkipPayload).reason === 'duplicate')).toBe(true)
+        const skips = eventLog.recent({ type: 'heartbeat.skip' })
+        expect(skips.some((s) => (s.payload as { reason: string }).reason === 'duplicate')).toBe(true)
       })
 
       expect(delivered).toHaveLength(1)
@@ -318,17 +367,22 @@ describe('heartbeat', () => {
 
       heartbeat = createHeartbeat({
         config: makeConfig(),
-        agentWorkListener, registry: listenerRegistry, session,
+        agentWorkRunner, cronEngine, registry: listenerRegistry, session,
       })
       await heartbeat.start()
+      const jobId = cronEngine.list()[0].id
 
       mockEngine.setNotifyUserCall('First alert')
-      await heartbeat.runNow()
-      await vi.waitFor(() => { expect(delivered).toHaveLength(1) })
+      await cronEngine.runNow(jobId)
+      await vi.waitFor(() => {
+        expect(delivered).toHaveLength(1)
+      })
 
       mockEngine.setNotifyUserCall('Second different alert')
-      await heartbeat.runNow()
-      await vi.waitFor(() => { expect(delivered).toHaveLength(2) })
+      await cronEngine.runNow(jobId)
+      await vi.waitFor(() => {
+        expect(delivered).toHaveLength(2)
+      })
 
       expect(delivered).toEqual(['First alert', 'Second different alert'])
     })
@@ -337,91 +391,101 @@ describe('heartbeat', () => {
   // ==================== Error Handling ====================
 
   describe('error handling', () => {
-    it('emits agent.work.error on AI failure', async () => {
+    it('emits heartbeat.error on AI failure', async () => {
       mockEngine.setShouldThrow(new Error('AI down'))
 
       heartbeat = createHeartbeat({
         config: makeConfig(),
-        agentWorkListener, registry: listenerRegistry, session,
+        agentWorkRunner, cronEngine, registry: listenerRegistry, session,
       })
       await heartbeat.start()
-      await heartbeat.runNow()
+
+      await cronEngine.runNow(cronEngine.list()[0].id)
 
       await vi.waitFor(() => {
-        expect(eventLog.recent({ type: 'agent.work.error' })).toHaveLength(1)
+        expect(eventLog.recent({ type: 'heartbeat.error' })).toHaveLength(1)
       })
 
-      const err = eventLog.recent({ type: 'agent.work.error' })[0].payload as AgentWorkErrorPayload
-      expect(err.source).toBe('heartbeat')
-      expect(err.error).toBe('AI down')
+      const errors = eventLog.recent({ type: 'heartbeat.error' })
+      expect(errors[0].payload).toMatchObject({ error: 'AI down' })
     })
 
-    it('handles notify failure — emits done with delivered=false', async () => {
+    it('handles notify failure gracefully — emits done with delivered=false', async () => {
       mockEngine.setNotifyUserCall('alert text')
+      // Force the underlying append to reject. The runner should still
+      // emit done with delivered=false; the listener should not crash.
       const originalAppend = notificationsStore.append.bind(notificationsStore)
       notificationsStore.append = async () => { throw new Error('store failed') }
 
       heartbeat = createHeartbeat({
         config: makeConfig(),
-        agentWorkListener, registry: listenerRegistry, session,
+        agentWorkRunner, cronEngine, registry: listenerRegistry, session,
       })
       await heartbeat.start()
-      await heartbeat.runNow()
+
+      await cronEngine.runNow(cronEngine.list()[0].id)
 
       await vi.waitFor(() => {
-        expect(eventLog.recent({ type: 'agent.work.done' })).toHaveLength(1)
+        expect(eventLog.recent({ type: 'heartbeat.done' })).toHaveLength(1)
       })
 
-      const done = eventLog.recent({ type: 'agent.work.done' })[0].payload as AgentWorkDonePayload
-      expect(done.delivered).toBe(false)
+      const done = eventLog.recent({ type: 'heartbeat.done' })
+      expect((done[0].payload as { delivered: boolean }).delivered).toBe(false)
 
       notificationsStore.append = originalAppend
     })
   })
 
-  // ==================== stop ====================
+  // ==================== Lifecycle ====================
 
-  describe('stop', () => {
-    it('runNow is a no-op after stop()', async () => {
+  describe('lifecycle', () => {
+    it('stops listening after stop()', async () => {
       heartbeat = createHeartbeat({
         config: makeConfig(),
-        agentWorkListener, registry: listenerRegistry, session,
+        agentWorkRunner, cronEngine, registry: listenerRegistry, session,
       })
       await heartbeat.start()
       heartbeat.stop()
 
-      await heartbeat.runNow()
+      await cronEngine.runNow(cronEngine.list()[0].id)
       await new Promise((r) => setTimeout(r, 50))
 
       expect(mockEngine.askWithSession).not.toHaveBeenCalled()
     })
   })
 
-  // ==================== setEnabled ====================
+  // ==================== setEnabled / isEnabled ====================
 
   describe('setEnabled', () => {
     it('enables a previously disabled heartbeat', async () => {
       heartbeat = createHeartbeat({
         config: makeConfig({ enabled: false }),
-        agentWorkListener, registry: listenerRegistry, session,
+        agentWorkRunner, cronEngine, registry: listenerRegistry, session,
       })
       await heartbeat.start()
+
       expect(heartbeat.isEnabled()).toBe(false)
+      expect(cronEngine.list()[0].enabled).toBe(false)
 
       await heartbeat.setEnabled(true)
+
       expect(heartbeat.isEnabled()).toBe(true)
+      expect(cronEngine.list()[0].enabled).toBe(true)
     })
 
     it('disables an enabled heartbeat', async () => {
       heartbeat = createHeartbeat({
         config: makeConfig({ enabled: true }),
-        agentWorkListener, registry: listenerRegistry, session,
+        agentWorkRunner, cronEngine, registry: listenerRegistry, session,
       })
       await heartbeat.start()
+
       expect(heartbeat.isEnabled()).toBe(true)
 
       await heartbeat.setEnabled(false)
+
       expect(heartbeat.isEnabled()).toBe(false)
+      expect(cronEngine.list()[0].enabled).toBe(false)
     })
 
     it('persists config via writeConfigSection', async () => {
@@ -429,7 +493,7 @@ describe('heartbeat', () => {
 
       heartbeat = createHeartbeat({
         config: makeConfig({ enabled: false }),
-        agentWorkListener, registry: listenerRegistry, session,
+        agentWorkRunner, cronEngine, registry: listenerRegistry, session,
       })
       await heartbeat.start()
       await heartbeat.setEnabled(true)
@@ -440,22 +504,25 @@ describe('heartbeat', () => {
       )
     })
 
-    it('runNow ignores the enabled flag (always fires for manual trigger)', async () => {
+    it('allows firing after setEnabled(true)', async () => {
       const delivered: string[] = []
       notificationsStore.onAppended((entry) => { delivered.push(entry.text) })
 
-      mockEngine.setNotifyUserCall('manual-fire')
+      mockEngine.setNotifyUserCall('after-enable')
 
       heartbeat = createHeartbeat({
         config: makeConfig({ enabled: false }),
-        agentWorkListener, registry: listenerRegistry, session,
+        agentWorkRunner, cronEngine, registry: listenerRegistry, session,
       })
       await heartbeat.start()
-      // Even though enabled=false, manual runNow should still work
-      await heartbeat.runNow()
+      await heartbeat.setEnabled(true)
 
-      await vi.waitFor(() => { expect(delivered).toHaveLength(1) })
-      expect(delivered[0]).toBe('manual-fire')
+      await cronEngine.runNow(cronEngine.list()[0].id)
+
+      await vi.waitFor(() => {
+        expect(delivered).toHaveLength(1)
+      })
+      expect(delivered[0]).toBe('after-enable')
     })
   })
 })
@@ -470,14 +537,16 @@ describe('isWithinActiveHours', () => {
   it('returns true within normal range', () => {
     const ts = todayAt(15, 0).getTime()
     expect(isWithinActiveHours(
-      { start: '09:00', end: '22:00', timezone: 'local' }, ts,
+      { start: '09:00', end: '22:00', timezone: 'local' },
+      ts,
     )).toBe(true)
   })
 
   it('returns false outside normal range', () => {
     const ts = todayAt(3, 0).getTime()
     expect(isWithinActiveHours(
-      { start: '09:00', end: '22:00', timezone: 'local' }, ts,
+      { start: '09:00', end: '22:00', timezone: 'local' },
+      ts,
     )).toBe(false)
   })
 
@@ -486,10 +555,12 @@ describe('isWithinActiveHours', () => {
       { start: '22:00', end: '06:00', timezone: 'local' },
       todayAt(23, 0).getTime(),
     )).toBe(true)
+
     expect(isWithinActiveHours(
       { start: '22:00', end: '06:00', timezone: 'local' },
       todayAt(3, 0).getTime(),
     )).toBe(true)
+
     expect(isWithinActiveHours(
       { start: '22:00', end: '06:00', timezone: 'local' },
       todayAt(12, 0).getTime(),
@@ -529,7 +600,7 @@ describe('HeartbeatDedup', () => {
     expect(d.isDuplicate('world', 500)).toBe(false)
   })
 
-  it('exposes lastText', () => {
+  it('exposes lastText (load-bearing for buildDonePayload)', () => {
     const d = new HeartbeatDedup()
     expect(d.lastText).toBeNull()
     d.record('first', 100)

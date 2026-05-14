@@ -252,119 +252,53 @@ describe('createTradingTools — getOrders summarization', () => {
   })
 })
 
-// ==================== getQuote (aliceId resolution) ====================
+// ==================== getPortfolio ====================
 
-describe('createTradingTools — getQuote', () => {
-  it('resolves aliceId via UTA so broker sees a contract with native fields', async () => {
-    const broker = new MockBroker({ id: 'mock-paper' })
-    const spy = vi.spyOn(broker, 'getQuote')
-    const tools = createTradingTools(makeManager(broker))
+describe('createTradingTools — getPortfolio', () => {
+  it('returns positions with aliceId and calculated percentages', async () => {
+    const broker = new MockBroker({ id: 'mock-paper', cash: 100000 })
+    broker.setMarkPrice('AAPL', 150)
+    broker.setMarkPrice('TSLA', 200)
 
-    const result = await (tools.getQuote.execute as Function)({ aliceId: 'mock-paper|AAPL' })
+    // AAPL: 100 shares @ 150 = 15,000
+    broker.externalDeposit({ nativeKey: 'AAPL', quantity: 100 })
+    // TSLA: 50 shares @ 200 = 10,000
+    broker.externalDeposit({ nativeKey: 'TSLA', quantity: 50 })
 
-    expect(spy).toHaveBeenCalledTimes(1)
-    const [passedContract] = spy.mock.calls[0]
-    // Without contractFromAliceId, this would be empty and broker resolution
-    // would fail. With the fix, MockBroker.resolveNativeKey populates symbol.
-    expect(passedContract.symbol || passedContract.localSymbol).toBeTruthy()
-    expect(passedContract.aliceId).toBe('mock-paper|AAPL')
-    expect(result.source).toBe('mock-paper')
+    const mgr = makeManager(broker)
+    const tools = createTradingTools(mgr)
+
+    const result = await (tools.getPortfolio.execute as Function)({ source: 'mock-paper' })
+
+    expect(Array.isArray(result)).toBe(true)
+    expect(result).toHaveLength(2)
+
+    const aapl = result.find((p: any) => p.symbol === 'AAPL')
+    expect(aapl).toBeDefined()
+    expect(aapl.aliceId).toBe('mock-paper|AAPL')
+    expect(aapl.marketValue).toBe('15000')
+
+    const tsla = result.find((p: any) => p.symbol === 'TSLA')
+    expect(tsla).toBeDefined()
+    expect(tsla.aliceId).toBe('mock-paper|TSLA')
+    expect(tsla.marketValue).toBe('10000')
   })
 
-  it('returns error on malformed aliceId', async () => {
+  it('filters by symbol', async () => {
     const broker = new MockBroker({ id: 'mock-paper' })
-    const tools = createTradingTools(makeManager(broker))
-    const result = await (tools.getQuote.execute as Function)({ aliceId: 'no-separator-here' })
-    expect(result.error).toMatch(/Invalid aliceId/)
-  })
+    broker.setMarkPrice('AAPL', 150)
+    broker.setMarkPrice('TSLA', 200)
+    broker.externalDeposit({ nativeKey: 'AAPL', quantity: 100 })
+    broker.externalDeposit({ nativeKey: 'TSLA', quantity: 50 })
 
-  it('routes to the UTA encoded in the aliceId without an explicit source', async () => {
-    const a1 = new MockBroker({ id: 'alpaca-paper' })
-    const a2 = new MockBroker({ id: 'bybit-main' })
-    const spy1 = vi.spyOn(a1, 'getQuote')
-    const spy2 = vi.spyOn(a2, 'getQuote')
-    const tools = createTradingTools(makeManager(a1, a2))
+    const mgr = makeManager(broker)
+    const tools = createTradingTools(mgr)
 
-    await (tools.getQuote.execute as Function)({ aliceId: 'bybit-main|BTC' })
+    const result = await (tools.getPortfolio.execute as Function)({ source: 'mock-paper', symbol: 'AAPL' })
 
-    expect(spy2).toHaveBeenCalledTimes(1)
-    expect(spy1).not.toHaveBeenCalled()
-  })
-})
-
-// ==================== getContractDetails (aliceId resolution) ====================
-
-describe('createTradingTools — getContractDetails', () => {
-  it('expands aliceId via UTA before calling broker.getContractDetails', async () => {
-    const broker = new MockBroker({ id: 'mock-paper' })
-    const spy = vi.spyOn(broker, 'getContractDetails')
-    const tools = createTradingTools(makeManager(broker))
-
-    await (tools.getContractDetails.execute as Function)({
-      source: 'mock-paper',
-      aliceId: 'mock-paper|AAPL',
-    })
-
-    expect(spy).toHaveBeenCalledTimes(1)
-    const [passedQuery] = spy.mock.calls[0]
-    expect(passedQuery.symbol || passedQuery.localSymbol).toBeTruthy()
-    expect(passedQuery.aliceId).toBe('mock-paper|AAPL')
-  })
-
-  it('returns error on cross-UTA aliceId mismatch', async () => {
-    const broker = new MockBroker({ id: 'mock-paper' })
-    const tools = createTradingTools(makeManager(broker))
-    const result = await (tools.getContractDetails.execute as Function)({
-      source: 'mock-paper',
-      aliceId: 'other-account|AAPL',
-    })
-    expect(result.error).toMatch(/belongs to UTA "other-account"/)
-  })
-})
-
-// ==================== placeOrder schema (AI ergonomics) ====================
-
-describe('placeOrder inputSchema', () => {
-  // LLMs frequently emit "" for fields they don't intend to set rather than
-  // omitting the key. Without empty-string tolerance, every optional numeric
-  // field rejects with "must be a positive numeric string" and the whole MKT
-  // call fails at the schema gate (the cashQty/lmtPrice/auxPrice cluster bug
-  // reported 2026-05-12).
-  it('treats empty-string optional numeric fields as omitted', () => {
-    const broker = new MockBroker({ id: 'mock-paper' })
-    const tools = createTradingTools(makeManager(broker))
-
-    const result = (tools.placeOrder.inputSchema as any).safeParse({
-      source: 'mock-paper',
-      aliceId: 'mock-paper|AAPL',
-      action: 'BUY',
-      orderType: 'MKT',
-      totalQuantity: '0.01',
-      cashQty: '',
-      lmtPrice: '',
-      auxPrice: '',
-      trailStopPrice: '',
-      trailingPercent: '',
-    })
-
-    expect(result.success).toBe(true)
-    expect(result.data.cashQty).toBeUndefined()
-    expect(result.data.lmtPrice).toBeUndefined()
-    expect(result.data.totalQuantity).toBe('0.01')
-  })
-
-  it('still rejects non-empty invalid numerics', () => {
-    const broker = new MockBroker({ id: 'mock-paper' })
-    const tools = createTradingTools(makeManager(broker))
-
-    const result = (tools.placeOrder.inputSchema as any).safeParse({
-      source: 'mock-paper',
-      aliceId: 'mock-paper|AAPL',
-      action: 'BUY',
-      orderType: 'MKT',
-      totalQuantity: '0',
-    })
-
-    expect(result.success).toBe(false)
+    expect(Array.isArray(result)).toBe(true)
+    expect(result).toHaveLength(1)
+    expect(result[0].symbol).toBe('AAPL')
+    expect(result[0].aliceId).toBe('mock-paper|AAPL')
   })
 })

@@ -11,7 +11,6 @@ import { z } from 'zod'
 import Decimal from 'decimal.js'
 import { Contract, UNSET_DECIMAL, coerceSecType } from '@traderalice/ibkr'
 import type { UTAManager } from '@/domain/trading/uta-manager.js'
-import { UnifiedTradingAccount } from '@/domain/trading/UnifiedTradingAccount.js'
 import { BrokerError, type OpenOrder } from '@/domain/trading/brokers/types.js'
 import type { FxService } from '@/domain/trading/fx-service.js'
 import { normalizeBrokerSearchPattern } from '@/domain/trading/contract-search-rules.js'
@@ -76,20 +75,11 @@ const sourceDesc = (required: boolean, extra?: string) => {
  * when the schema demands them; permissive `union([number, string])`
  * is unnecessary and re-opens the precision-loss path that this
  * whole sweep was meant to close.
- *
- * Empty string `""` is normalized to `undefined` before validation.
- * Why: when this validator is used with `.optional()`, LLMs often
- * emit `""` for fields they don't intend to set (instead of omitting
- * the key), and a bare `z.string().refine(...).optional()` would
- * then reject the empty string against the positive-number rule.
- * Treating `""` as "not provided" matches the AI-ergonomics the
- * `.optional()` site actually wants.
  */
 const positiveNumeric = z
   .string()
   .refine(
     (v) => {
-      if (v === '') return true
       try {
         return new Decimal(v).gt(0) && new Decimal(v).isFinite()
       } catch {
@@ -98,7 +88,6 @@ const positiveNumeric = z
     },
     { message: 'must be a positive numeric string (e.g. "0.001", "150")' },
   )
-  .transform((v) => (v === '' ? undefined : v))
 
 export function createTradingTools(manager: UTAManager, fxService?: FxService): Record<string, Tool> {
   return {
@@ -149,22 +138,15 @@ hitting the broker, which otherwise expects the bare base ticker.`,
       inputSchema: z.object({
         source: z.string().describe(sourceDesc(true)),
         symbol: z.string().optional().describe('Symbol to look up'),
-        aliceId: z.string().optional().describe('Contract ID (format: accountId|nativeKey, from searchContracts)'),
+        aliceId: z.string().optional().describe('Contract ID (format: accountId|nativeKey, from searchContracts or getPortfolio)'),
         secType: z.string().optional().describe('Security type filter'),
         currency: z.string().optional().describe('Currency filter'),
       }),
       execute: async ({ source, symbol, aliceId, secType, currency }) => {
         const uta = manager.resolveOne(source)
-        // When aliceId is provided, expand it via the broker's native-key
-        // resolver so the broker actually sees `localSymbol`/`symbol` —
-        // bare `query.aliceId = aliceId` is invisible to broker resolution.
-        let query: Contract
-        try {
-          query = aliceId ? uta.contractFromAliceId(aliceId) : new Contract()
-        } catch (err) {
-          return handleBrokerError(err)
-        }
+        const query = new Contract()
         if (symbol) query.symbol = symbol
+        if (aliceId) query.aliceId = aliceId
         if (secType) query.secType = coerceSecType(secType)
         if (currency) query.currency = currency
         const details = await uta.getContractDetails(query)
@@ -236,9 +218,17 @@ If this tool returns an error with transient=true, wait a few seconds and retry 
               const percentOfEquity = netLiqUsd.gt(0) ? mvUsd.div(netLiqUsd).mul(100) : new Decimal(0)
               const percentOfPortfolio = totalMarketValueUsd.gt(0) ? mvUsd.div(totalMarketValueUsd).mul(100) : new Decimal(0)
               allPositions.push({
-                source: uta.id, symbol: pos.contract.symbol, currency: pos.currency, side: pos.side,
-                quantity: pos.quantity.toString(), avgCost: pos.avgCost, marketPrice: pos.marketPrice,
-                marketValue: pos.marketValue, unrealizedPnL: pos.unrealizedPnL, realizedPnL: pos.realizedPnL,
+                source: uta.id,
+                aliceId: pos.contract.aliceId,
+                symbol: pos.contract.symbol,
+                currency: pos.currency,
+                side: pos.side,
+                quantity: pos.quantity.toString(),
+                avgCost: pos.avgCost,
+                marketPrice: pos.marketPrice,
+                marketValue: pos.marketValue,
+                unrealizedPnL: pos.unrealizedPnL,
+                realizedPnL: pos.realizedPnL,
                 percentageOfEquity: `${percentOfEquity.toFixed(1)}%`,
                 percentageOfPortfolio: `${percentOfPortfolio.toFixed(1)}%`,
               })
@@ -293,24 +283,20 @@ If this tool returns an error with transient=true, wait a few seconds and retry 
       description: `Query the latest quote/price for a contract.
 If this tool returns an error with transient=true, wait a few seconds and retry once before reporting to the user.`,
       inputSchema: z.object({
-        aliceId: z.string().describe('Contract ID (format: accountId|nativeKey, from searchContracts)'),
+        aliceId: z.string().describe('Contract ID (format: accountId|nativeKey, from searchContracts or getPortfolio)'),
         source: z.string().optional().describe(sourceDesc(false)),
       }),
       execute: async ({ aliceId, source }) => {
-        // aliceId is UTA-scoped (`{utaId}|{nativeKey}`); route directly to the
-        // owning UTA. Fall back to caller-supplied `source` if given (allows
-        // overrides / sanity-check). `contractFromAliceId` cross-validates.
-        const parsed = UnifiedTradingAccount.parseAliceId(aliceId)
-        if (!parsed) {
-          return { error: `Invalid aliceId "${aliceId}". Expected format: "accountId|nativeKey".` }
+        const targets = manager.resolve(source)
+        if (targets.length === 0) return { error: 'No accounts available.' }
+        const query = new Contract()
+        query.aliceId = aliceId
+        const results: Array<Record<string, unknown>> = []
+        for (const uta of targets) {
+          try { results.push({ source: uta.id, ...await uta.getQuote(query) }) } catch { /* skip */ }
         }
-        try {
-          const uta = manager.resolveOne(source ?? parsed.utaId)
-          const contract = uta.contractFromAliceId(aliceId)
-          return { source: uta.id, ...await uta.getQuote(contract) }
-        } catch (err) {
-          return handleBrokerError(err)
-        }
+        if (results.length === 0) return { error: `No account could quote aliceId "${aliceId}".` }
+        return results.length === 1 ? results[0] : results
       },
     }),
 
@@ -406,7 +392,7 @@ Required params by orderType:
 Optional: attach takeProfit and/or stopLoss for automatic exit orders.`,
       inputSchema: z.object({
         source: z.string().describe(sourceDesc(true)),
-        aliceId: z.string().describe('Contract ID (format: accountId|nativeKey, from searchContracts)'),
+        aliceId: z.string().describe('Contract ID (format: accountId|nativeKey, from searchContracts or getPortfolio)'),
         symbol: z.string().optional().describe('Human-readable symbol (optional, for display only)'),
         action: z.enum(['BUY', 'SELL']).describe('Order direction'),
         orderType: z.enum(['MKT', 'LMT', 'STP', 'STP LMT', 'TRAIL', 'TRAIL LIMIT', 'MOC']).describe('Order type'),
@@ -453,7 +439,7 @@ Optional: attach takeProfit and/or stopLoss for automatic exit orders.`,
       description: 'Stage a position close.\nNOTE: This stages the operation. Call tradingCommit + tradingPush to execute.',
       inputSchema: z.object({
         source: z.string().describe(sourceDesc(true)),
-        aliceId: z.string().describe('Contract ID (format: accountId|nativeKey, from searchContracts)'),
+        aliceId: z.string().describe('Contract ID (format: accountId|nativeKey, from searchContracts or getPortfolio)'),
         symbol: z.string().optional().describe('Human-readable symbol. Optional.'),
         qty: positiveNumeric.optional().describe('Number of shares to sell. Decimal string. Default: sell all.'),
       }),
